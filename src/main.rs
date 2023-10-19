@@ -4,7 +4,7 @@ mod response;
 use std::sync::Arc;
 
 use clap::Parser;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use rand::{Rng, SeedableRng};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
@@ -59,6 +59,8 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
+    /// Upsreama addresses that have died
+    dead_upstream: Vec<String>,
 }
 
 #[tokio::main]
@@ -88,15 +90,17 @@ async fn main() -> io::Result<()> {
     };
     log::info!("Listening for requests on {}", options.bind);
 
+    let upstream_capacity = options.upstream.len();
     // Handle incoming connections
     let state = ProxyState {
         upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
+        dead_upstream: Vec::with_capacity(upstream_capacity),
     };
 
-    let state = Arc::new(Mutex::new(state));
+    let state = Arc::new(RwLock::new(state));
 
     loop {
         let (stream, _) = match listener.accept().await {
@@ -114,18 +118,40 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
-async fn connect_to_upstream(state: Arc<Mutex<ProxyState>>) -> Result<TcpStream, std::io::Error> {
+async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream, std::io::Error> {
     let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_ip = {
-        let state = state.lock();
-        let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-        state.upstream_addresses[upstream_idx].clone()
-    };
-    TcpStream::connect(&upstream_ip).await.or_else(|err| {
-        log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-        Err(err)
-    })
-    // TODO: implement failover (milestone 3)
+    loop {
+        let upstream_ip = {
+            let state = state.read();
+            let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
+            state.upstream_addresses[upstream_idx].clone()
+        };
+        match TcpStream::connect(&upstream_ip).await {
+            Err(err) => {
+                log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
+                {
+                    let mut state = state.write();
+                    if state.upstream_addresses.is_empty() {
+                        log::error!("All upstreams have died");
+                        return Err(err);
+                    }
+                    let dead_upstream_idx = match state
+                        .upstream_addresses
+                        .iter()
+                        .position(|addr| *addr == upstream_ip)
+                    {
+                        Some(idx) => idx,
+                        None => return Err(err),
+                    };
+                    let dead_upstream = state.upstream_addresses.swap_remove(dead_upstream_idx);
+                    state.dead_upstream.push(dead_upstream);
+                }
+                continue;
+            }
+            Ok(stream) => return Ok(stream),
+        }
+        // TODO: implement failover (milestone 3)
+    }
 }
 
 async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
@@ -141,7 +167,7 @@ async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Ve
     }
 }
 
-async fn handle_connection(mut client_conn: TcpStream, state: Arc<Mutex<ProxyState>>) {
+async fn handle_connection(mut client_conn: TcpStream, state: Arc<RwLock<ProxyState>>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
