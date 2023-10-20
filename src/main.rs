@@ -2,12 +2,21 @@ mod request;
 mod response;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use parking_lot::RwLock;
 use rand::{Rng, SeedableRng};
+use request::write_to_stream;
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::delay_for;
+
+#[derive(Debug, Clone)]
+enum Upstream {
+    Alive(String),
+    Dead(String),
+}
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -49,10 +58,8 @@ struct CmdOptions {
 /// You should add fields to this struct in later milestones.
 struct ProxyState {
     /// How frequently we check whether upstream servers are alive (Milestone 4)
-    #[allow(dead_code)]
     active_health_check_interval: usize,
     /// Where we should send requests when doing active health checks (Milestone 4)
-    #[allow(dead_code)]
     active_health_check_path: String,
     /// Maximum number of requests an individual IP can make in a minute (Milestone 5)
     #[allow(dead_code)]
@@ -99,8 +106,15 @@ async fn main() -> io::Result<()> {
         max_requests_per_minute: options.max_requests_per_minute,
         dead_upstream: Vec::with_capacity(upstream_capacity),
     };
+    let interval = Duration::from_secs(state.active_health_check_interval as u64);
 
     let state = Arc::new(RwLock::new(state));
+
+    let periodic_state = state.clone();
+
+    tokio::spawn(async move {
+        periodic_health_check(periodic_state, interval).await;
+    });
 
     loop {
         let (stream, _) = match listener.accept().await {
@@ -116,6 +130,88 @@ async fn main() -> io::Result<()> {
         });
     }
     Ok(())
+}
+
+async fn periodic_health_check(state: Arc<RwLock<ProxyState>>, interval: Duration) {
+    loop {
+        delay_for(interval).await;
+        let mut upstream_markers = Vec::new();
+        let (upstreams, path) = {
+            let state = state.read();
+            (
+                state
+                    .upstream_addresses
+                    .clone()
+                    .into_iter()
+                    .chain(state.dead_upstream.clone().into_iter())
+                    .collect::<Vec<String>>(),
+                state.active_health_check_path.clone(),
+            )
+        };
+        for upstream in upstreams {
+            let request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(&path)
+                .header("Host", &upstream)
+                .body(Vec::new())
+                .unwrap();
+            let mut stream = match TcpStream::connect(&upstream).await {
+                Err(err) => {
+                    log::error!("Server {} is  dead when connecting: {}", upstream, err);
+                    upstream_markers.push(Upstream::Dead(upstream.clone()));
+                    continue;
+                }
+                Ok(stream) => stream,
+            };
+
+            if let Err(err) = write_to_stream(&request, &mut stream).await {
+                log::error!(
+                    "Server {} is  dead when writing to stream: {}",
+                    upstream,
+                    err
+                );
+                upstream_markers.push(Upstream::Dead(upstream.clone()));
+                continue;
+            }
+
+            let status = match response::read_from_stream(&mut stream, request.method()).await {
+                Err(err) => {
+                    log::error!(
+                        "Server {} is  dead when receiving response: {:?}",
+                        upstream,
+                        err
+                    );
+                    upstream_markers.push(Upstream::Dead(upstream.clone()));
+                    continue;
+                }
+                Ok(resp) => resp.status(),
+            };
+
+            if status != 200 {
+                log::error!("Server {} is still dead with status {}", upstream, status);
+                upstream_markers.push(Upstream::Dead(upstream.clone()));
+                continue;
+            }
+
+            upstream_markers.push(Upstream::Alive(upstream));
+        }
+
+        if upstream_markers.iter().all(|e| match e {
+            Upstream::Alive(_) => true,
+            Upstream::Dead(_) => false,
+        }) {
+            continue;
+        }
+        let mut state = state.write();
+        state.dead_upstream.clear();
+        state.upstream_addresses.clear();
+        for ele in upstream_markers {
+            match ele {
+                Upstream::Alive(upstream) => state.upstream_addresses.push(upstream),
+                Upstream::Dead(upstream) => state.dead_upstream.push(upstream),
+            }
+        }
+    }
 }
 
 async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream, std::io::Error> {
@@ -144,12 +240,14 @@ async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream
                         None => return Err(err),
                     };
                     let dead_upstream = state.upstream_addresses.swap_remove(dead_upstream_idx);
+                    log::error!("Upstream {} has died", dead_upstream);
                     state.dead_upstream.push(dead_upstream);
                 }
                 continue;
             }
             Ok(stream) => return Ok(stream),
-        }
+        };
+
         // TODO: implement failover (milestone 3)
     }
 }
