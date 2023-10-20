@@ -10,6 +10,7 @@ use rand::{Rng, SeedableRng};
 use request::write_to_stream;
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use tokio::time::delay_for;
 
 #[derive(Debug, Clone)]
@@ -132,10 +133,55 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
+async fn health_check(upstream: String, path: String) -> Upstream {
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(&path)
+        .header("Host", &upstream)
+        .body(Vec::new())
+        .unwrap();
+    let mut stream = match TcpStream::connect(&upstream).await {
+        Err(err) => {
+            log::error!("Server {} is  dead when connecting: {}", upstream, err);
+            return Upstream::Dead(upstream.clone());
+        }
+        Ok(stream) => stream,
+    };
+
+    if let Err(err) = write_to_stream(&request, &mut stream).await {
+        log::error!(
+            "Server {} is  dead when writing to stream: {}",
+            upstream,
+            err
+        );
+        return Upstream::Dead(upstream.clone());
+    }
+
+    let status = match response::read_from_stream(&mut stream, request.method()).await {
+        Err(err) => {
+            log::error!(
+                "Server {} is  dead when receiving response: {:?}",
+                upstream,
+                err
+            );
+            return Upstream::Dead(upstream.clone());
+        }
+        Ok(resp) => resp.status(),
+    };
+
+    if status != 200 {
+        log::error!("Server {} is still dead with status {}", upstream, status);
+        return Upstream::Dead(upstream.clone());
+    }
+
+    return Upstream::Alive(upstream.clone());
+}
+
 async fn periodic_health_check(state: Arc<RwLock<ProxyState>>, interval: Duration) {
     loop {
         delay_for(interval).await;
         let mut upstream_markers = Vec::new();
+        let mut handles: Vec<JoinHandle<Upstream>> = Vec::new();
         let (upstreams, path) = {
             let state = state.read();
             (
@@ -149,53 +195,19 @@ async fn periodic_health_check(state: Arc<RwLock<ProxyState>>, interval: Duratio
             )
         };
         for upstream in upstreams {
-            let request = http::Request::builder()
-                .method(http::Method::GET)
-                .uri(&path)
-                .header("Host", &upstream)
-                .body(Vec::new())
-                .unwrap();
-            let mut stream = match TcpStream::connect(&upstream).await {
-                Err(err) => {
-                    log::error!("Server {} is  dead when connecting: {}", upstream, err);
-                    upstream_markers.push(Upstream::Dead(upstream.clone()));
-                    continue;
-                }
-                Ok(stream) => stream,
-            };
-
-            if let Err(err) = write_to_stream(&request, &mut stream).await {
-                log::error!(
-                    "Server {} is  dead when writing to stream: {}",
-                    upstream,
-                    err
-                );
-                upstream_markers.push(Upstream::Dead(upstream.clone()));
-                continue;
-            }
-
-            let status = match response::read_from_stream(&mut stream, request.method()).await {
-                Err(err) => {
-                    log::error!(
-                        "Server {} is  dead when receiving response: {:?}",
-                        upstream,
-                        err
-                    );
-                    upstream_markers.push(Upstream::Dead(upstream.clone()));
-                    continue;
-                }
-                Ok(resp) => resp.status(),
-            };
-
-            if status != 200 {
-                log::error!("Server {} is still dead with status {}", upstream, status);
-                upstream_markers.push(Upstream::Dead(upstream.clone()));
-                continue;
-            }
-
-            upstream_markers.push(Upstream::Alive(upstream));
+            let handle = tokio::spawn(health_check(upstream, path.clone()));
+            handles.push(handle);
         }
-
+        for handle in handles {
+            let upstream = match handle.await {
+                Ok(upstream) => upstream,
+                Err(err) => {
+                    log::error!("Error in joining durring health check: {}", err);
+                    continue;
+                }
+            };
+            upstream_markers.push(upstream);
+        }
         if upstream_markers.iter().all(|e| match e {
             Upstream::Alive(_) => true,
             Upstream::Dead(_) => false,
@@ -213,7 +225,6 @@ async fn periodic_health_check(state: Arc<RwLock<ProxyState>>, interval: Duratio
         }
     }
 }
-
 async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream, std::io::Error> {
     let mut rng = rand::rngs::StdRng::from_entropy();
     loop {
