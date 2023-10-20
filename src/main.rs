@@ -1,6 +1,7 @@
 mod request;
 mod response;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +66,8 @@ struct ProxyState {
     /// Maximum number of requests an individual IP can make in a minute (Milestone 5)
     #[allow(dead_code)]
     max_requests_per_minute: usize,
+    // Hash map to map between the upstream and the number of request the server is handling
+    rate_tracker: HashMap<String, usize>,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
     /// Upsreama addresses that have died
@@ -97,10 +100,10 @@ async fn main() -> io::Result<()> {
         }
     };
     log::info!("Listening for requests on {}", options.bind);
-
     let upstream_capacity = options.upstream.len();
     // Handle incoming connections
     let state = ProxyState {
+        rate_tracker: HashMap::new(),
         upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
@@ -113,8 +116,21 @@ async fn main() -> io::Result<()> {
 
     let periodic_state = state.clone();
 
+    // task to perform health check periodically
     tokio::spawn(async move {
         periodic_health_check(periodic_state, interval).await;
+    });
+
+    // task to reset counter at the end of the windows for rate limiting
+    let counter_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            delay_for(Duration::from_secs(60)).await;
+            let mut state = counter_state.write();
+            for (_key, value) in state.rate_tracker.iter_mut() {
+                *value = 0;
+            }
+        }
     });
 
     loop {
@@ -258,8 +274,6 @@ async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream
             }
             Ok(stream) => return Ok(stream),
         };
-
-        // TODO: implement failover (milestone 3)
     }
 }
 
@@ -276,9 +290,35 @@ async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Ve
     }
 }
 
+fn is_over_rate_limit(client_ip: &String, state: Arc<RwLock<ProxyState>>) -> bool {
+    let mut rate_state = state.write();
+    if rate_state.max_requests_per_minute == 0 {
+        false
+    } else {
+        let count = rate_state
+            .rate_tracker
+            .entry(client_ip.clone())
+            .and_modify(|e| *e += 1)
+            .or_insert(1);
+        if *count > rate_state.max_requests_per_minute {
+            true
+        } else {
+            false
+        }
+    }
+}
+
 async fn handle_connection(mut client_conn: TcpStream, state: Arc<RwLock<ProxyState>>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
+
+    // Rate limiting per client ip
+    if is_over_rate_limit(&client_ip, state.clone()) {
+        log::info!("Ip {} sends too many requests", client_ip);
+        let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+        send_response(&mut client_conn, &response).await;
+        return;
+    }
 
     // Open a connection to a random destination server
     let mut upstream_conn = match connect_to_upstream(state).await {
